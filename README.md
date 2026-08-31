@@ -15,26 +15,32 @@ dispatch. The callback linked list contains a garbage pointer on first dispatch,
 causing a null/invalid pointer dereference inside `hipProfilerRegisterChunkCallbackExt`.
 
 ```
-hipLaunchKernel+0x85: call r10          ← dispatches profiler callbacks
+hipLaunchKernel+0x85: call r10
   → hipRegisterTracerCallback (x5)
   → hipProfilerRegisterChunkCallbackExt
-    → mov rax, [rcx+8]                  ← CRASH: rcx = 0x7b2c450fc892ac84 (garbage)
+    → mov rax, [rcx+8]    ← CRASH: rcx = 0x7b2c450fc892ac84 (garbage pointer)
 ```
 
 **Exception:** `0xC0000005 ACCESS_VIOLATION` in `amdhip64_7.dll`
 
 ## The Fix
 
-NOP out the profiler callback dispatch call in `hipLaunchKernel`:
+Patch `hipProfilerRegisterChunkCallbackExt` to immediately return 0:
 
 ```
-File offset 0x4549B5:
-  Before: 41 FF D2   (call r10)
-  After:  90 90 90   (NOP NOP NOP)
+File offset 0x4BBD60 (hipProfilerRegisterChunkCallbackExt):
+  Before: 48 89 5C ...   (function prologue)
+  After:  33 C0 C3       (xor eax,eax; ret  →  always return 0 / not found)
 ```
 
-This disables the profiler callback dispatch entirely. All PyTorch training,
+This disables the profiler callback walk entirely. The function returns 0 (callback
+not found) before dereferencing the corrupt pointer. All PyTorch training,
 inference, and compute operations work correctly after this patch.
+
+> **⚠️ Earlier versions of this patch NOPed `hipLaunchKernel+0x85` (`41 FF D2 → 90 90 90`).
+> That was incorrect — it disabled the actual kernel dispatch call, causing all GPU
+> tensors to be zero. The correct fix targets `hipProfilerRegisterChunkCallbackExt` directly.
+> Re-run the latest patcher script to apply the correct patch.**
 
 ## Usage
 
@@ -49,9 +55,18 @@ python patch_amdhip64.py "rocm_env\Lib\site-packages\_rocm_sdk_core\bin\amdhip64
 
 The script:
 - Creates a `.bak` backup before patching
+- Reverts the old wrong patch automatically if present
 - Tries the known offset first (fast path)
 - Falls back to dynamic export-table search for other ROCm versions
 - Is idempotent — safe to run multiple times
+
+Verify the patch worked:
+```python
+import torch
+t = torch.tensor([0.265625, -0.1, 0.5], dtype=torch.bfloat16)
+print(t.cuda())
+# Expected: tensor([ 0.2656, -0.1001,  0.5000], device='cuda:0')
+```
 
 ## Environment
 
@@ -65,17 +80,24 @@ The script:
 
 ## Upstream Issues
 
-- ROCm/TheRock: [https://github.com/ROCm/TheRock/issues/7732]
-- ROCm/rocm-systems: [https://github.com/ROCm/rocm-systems/issues/10924]
+- ROCm/TheRock: https://github.com/ROCm/TheRock/issues/7732
+- ROCm/rocm-systems: https://github.com/ROCm/rocm-systems/issues/10924
 
 ## How It Was Found
 
 The crash was analyzed using **WinDbg** live kernel debugging with child process
-tracking. The access violation was caught at its origin (not at process exit),
-revealing the full call chain and the garbage pointer value in `rcx`.
+tracking (`-o` flag). The access violation was caught at its origin (not at process
+exit), revealing the full call chain and the garbage pointer value in `rcx`.
 
-The patch offset was located by parsing the PE export table to find `hipLaunchKernel`,
-then scanning the function body for the `call r10` instruction at `+0x85`.
+The crash location was confirmed by:
+1. Setting `sxe av` (break on first-chance access violation)
+2. Running `~* kn` to get all thread stacks
+3. Identifying thread 9 with the `hipProfilerRegisterChunkCallbackExt` crash
+4. Inspecting `rcx = 0x7b2c450fc892ac84` (garbage, not null)
+5. Locating `hipProfilerRegisterChunkCallbackExt` via PE export table
+
+The correct patch offset was found by exporting the function RVA from the PE
+export directory and converting to file offset.
 
 ## Notes
 
@@ -86,7 +108,8 @@ then scanning the function body for the `call r10` instruction at `+0x85`.
 
 ## Related
 
-Additional workaround needed for FlashAttention backward pass crash (separate bug):
+Additional workaround needed for FlashAttention backward pass crash (separate bug
+in `aotriton_v2.dll` on RDNA 4 Windows):
 
 ```python
 model = AutoModelForCausalLM.from_pretrained(
